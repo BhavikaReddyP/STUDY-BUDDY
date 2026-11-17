@@ -1,0 +1,613 @@
+"""
+StudyBuddy - Student Productivity Hub
+A Tkinter desktop application with four modules:
+  1. Dashboard      - live summary of tasks, focus time and spending
+  2. Task Planner   - add / filter / complete / delete study tasks
+  3. Focus Timer    - Pomodoro-style countdown with session history
+  4. Expense Tracker- log spending, set a monthly budget, view a chart
+
+Data is stored locally in SQLite (studybuddy.db). Only the Python
+standard library is used.  Run:  python studybuddy.py
+Optional: python studybuddy.py --demo   (loads sample data in a temp DB)
+"""
+import datetime as dt
+import random
+import sqlite3
+import sys
+import tempfile
+import tkinter as tk
+from pathlib import Path
+from tkinter import messagebox, ttk
+
+DB_PATH = Path(__file__).with_name("studybuddy.db")
+C = dict(bg="#F4F2FA", card="#FFFFFF", primary="#5B3FA8", primary_dark="#46308A",
+         accent="#F2A541", text="#2B2B3A", muted="#7A7A8C", good="#2F9E6E",
+         bad="#D6455D", line="#E2DEEF")
+FONT = "Helvetica"
+BAR_COLORS = ["#5B3FA8", "#F2A541", "#2F9E6E", "#D6455D", "#3C8DBC", "#9B6BD6"]
+CATEGORIES = ["Food", "Travel", "Books", "Supplies", "Fun", "Other"]
+SUBJECTS = ["Maths", "Programming", "Physics", "English", "Electronics", "Other"]
+QUOTES = ["Small steps every day beat big bursts once a month.",
+          "Done is better than perfect.",
+          "Focus on progress, not perfection.",
+          "Your future self will thank you for starting now.",
+          "Discipline is choosing what you want most over what you want now."]
+
+
+def today():
+    return dt.date.today().isoformat()
+
+
+# ----------------------------------------------------------------- data layer
+class Database:
+    """Thin wrapper around SQLite so the GUI never writes SQL inline."""
+
+    def __init__(self, path=DB_PATH):
+        self.conn = sqlite3.connect(path)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS tasks(id INTEGER PRIMARY KEY,
+                title TEXT NOT NULL, subject TEXT, due TEXT,
+                priority TEXT, done INTEGER DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS sessions(id INTEGER PRIMARY KEY,
+                day TEXT, minutes INTEGER, label TEXT);
+            CREATE TABLE IF NOT EXISTS expenses(id INTEGER PRIMARY KEY,
+                day TEXT, category TEXT, amount REAL, note TEXT);
+            CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+        """)
+
+    def rows(self, sql, args=()):
+        return self.conn.execute(sql, args).fetchall()
+
+    def one(self, sql, args=()):
+        return self.conn.execute(sql, args).fetchone()[0]
+
+    def run(self, sql, args=()):
+        cur = self.conn.execute(sql, args)
+        self.conn.commit()
+        return cur
+
+    def get_budget(self):
+        r = self.rows("SELECT value FROM settings WHERE key='budget'")
+        return float(r[0][0]) if r else 5000.0
+
+    def set_budget(self, value):
+        self.run("INSERT OR REPLACE INTO settings VALUES('budget', ?)", (str(value),))
+
+    def seed_demo(self):
+        d = dt.date.today()
+        tasks = [("Finish DBMS assignment", "Programming", d + dt.timedelta(days=1), "High", 0),
+                 ("Revise Unit 3 - Calculus", "Maths", d + dt.timedelta(days=3), "Medium", 0),
+                 ("Lab record - Ohm's law", "Physics", d - dt.timedelta(days=1), "High", 0),
+                 ("Read chapter 5 notes", "English", d + dt.timedelta(days=5), "Low", 1),
+                 ("Mini project proposal", "Programming", d + dt.timedelta(days=7), "Medium", 0)]
+        for t in tasks:
+            self.run("INSERT INTO tasks(title,subject,due,priority,done) VALUES(?,?,?,?,?)",
+                     (t[0], t[1], t[2].isoformat(), t[3], t[4]))
+        for i, m in enumerate([50, 75, 25, 100, 60, 90, 45]):
+            day = (d - dt.timedelta(days=6 - i)).isoformat()
+            self.run("INSERT INTO sessions(day,minutes,label) VALUES(?,?,?)", (day, m, "Study"))
+        for cat, amt, note in [("Food", 640, "Canteen"), ("Travel", 380, "Metro pass"),
+                               ("Books", 750, "Textbook"), ("Supplies", 210, "Notebooks"),
+                               ("Fun", 420, "Movie"), ("Food", 520, "Snacks")]:
+            self.run("INSERT INTO expenses(day,category,amount,note) VALUES(?,?,?,?)",
+                     (today(), cat, amt, note))
+        self.set_budget(4500)
+
+
+# --------------------------------------------------------------- UI helpers
+def card(parent, **kw):
+    return tk.Frame(parent, bg=C["card"], highlightthickness=1,
+                    highlightbackground=C["line"], **kw)
+
+
+def draw_bars(canvas, items, unit="", colors=BAR_COLORS):
+    """Draw a simple labelled bar chart on a Canvas. items = [(label, value)]."""
+    canvas.delete("all")
+    w, h = canvas.winfo_width(), canvas.winfo_height()
+    if w < 50 or h < 50:
+        return
+    if not items or max(v for _, v in items) == 0:
+        canvas.create_text(w / 2, h / 2, text="No data yet", fill=C["muted"],
+                           font=(FONT, 11))
+        return
+    top, bottom, side = 24, 28, 20
+    peak = max(v for _, v in items)
+    slot = (w - 2 * side) / len(items)
+    bar_w = min(54, slot * 0.6)
+    for i, (label, value) in enumerate(items):
+        x0 = side + i * slot + (slot - bar_w) / 2
+        bar_h = (h - top - bottom) * value / peak
+        y0 = h - bottom - bar_h
+        canvas.create_rectangle(x0, y0, x0 + bar_w, h - bottom,
+                                fill=colors[i % len(colors)], outline="")
+        if value:
+            canvas.create_text(x0 + bar_w / 2, y0 - 9, text=f"{value:g}{unit}",
+                               fill=C["text"], font=(FONT, 9, "bold"))
+        canvas.create_text(x0 + bar_w / 2, h - 12, text=label, fill=C["muted"],
+                           font=(FONT, 9))
+    canvas.create_line(side, h - bottom, w - side, h - bottom, fill=C["line"])
+
+
+def make_tree(parent, columns, widths, height=10):
+    frame = tk.Frame(parent, bg=C["card"])
+    tree = ttk.Treeview(frame, columns=[c[0] for c in columns], show="headings",
+                        height=height, selectmode="browse")
+    for (key, title), width in zip(columns, widths):
+        tree.heading(key, text=title)
+        tree.column(key, width=width, anchor="w")
+    sb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+    tree.configure(yscrollcommand=sb.set)
+    tree.pack(side="left", fill="both", expand=True)
+    sb.pack(side="right", fill="y")
+    return frame, tree
+
+
+def field(parent, label, col, widget, row=0):
+    tk.Label(parent, text=label, bg=C["card"], fg=C["muted"],
+             font=(FONT, 9)).grid(row=row, column=col, sticky="w", padx=(0, 10))
+    widget.grid(row=row + 1, column=col, sticky="we", padx=(0, 10), pady=(0, 4))
+
+
+# --------------------------------------------------------------- Dashboard
+class DashboardTab(ttk.Frame):
+    def __init__(self, parent, app):
+        super().__init__(parent, style="Page.TFrame", padding=16)
+        self.app = app
+        self.stat_vars = {}
+        row = tk.Frame(self, bg=C["bg"])
+        row.pack(fill="x")
+        for i, (key, title, color) in enumerate([
+                ("pending", "Pending tasks", C["primary"]),
+                ("overdue", "Overdue", C["bad"]),
+                ("focus", "Focus today (min)", C["accent"]),
+                ("spent", "Spent this month", C["good"])]):
+            box = card(row, padx=16, pady=12)
+            box.grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else 10, 0))
+            row.columnconfigure(i, weight=1)
+            var = tk.StringVar(value="-")
+            self.stat_vars[key] = var
+            tk.Label(box, textvariable=var, bg=C["card"], fg=color,
+                     font=(FONT, 24, "bold")).pack(anchor="w")
+            tk.Label(box, text=title, bg=C["card"], fg=C["muted"],
+                     font=(FONT, 10)).pack(anchor="w")
+
+        lower = tk.Frame(self, bg=C["bg"])
+        lower.pack(fill="both", expand=True, pady=(14, 0))
+        lower.columnconfigure(0, weight=3)
+        lower.columnconfigure(1, weight=2)
+        lower.rowconfigure(0, weight=1)
+
+        left = card(lower, padx=14, pady=12)
+        left.grid(row=0, column=0, sticky="nsew")
+        tk.Label(left, text="Focus minutes - last 7 days", bg=C["card"], fg=C["text"],
+                 font=(FONT, 12, "bold")).pack(anchor="w")
+        self.chart = tk.Canvas(left, bg=C["card"], highlightthickness=0)
+        self.chart.pack(fill="both", expand=True)
+        self.chart.bind("<Configure>", lambda e: self.refresh())
+
+        right = card(lower, padx=14, pady=12)
+        right.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
+        tk.Label(right, text="Up next", bg=C["card"], fg=C["text"],
+                 font=(FONT, 12, "bold")).pack(anchor="w")
+        self.upnext = tk.Label(right, bg=C["card"], fg=C["text"], justify="left",
+                               anchor="nw", font=(FONT, 10), wraplength=300)
+        self.upnext.pack(fill="both", expand=True, pady=6)
+        self.quote = tk.Label(right, text=random.choice(QUOTES), bg=C["card"],
+                              fg=C["primary"], wraplength=300, justify="left",
+                              font=(FONT, 10, "italic"))
+        self.quote.pack(anchor="w", side="bottom")
+
+    def refresh(self):
+        db = self.app.db
+        t = today()
+        self.stat_vars["pending"].set(db.one("SELECT COUNT(*) FROM tasks WHERE done=0"))
+        self.stat_vars["overdue"].set(
+            db.one("SELECT COUNT(*) FROM tasks WHERE done=0 AND due<?", (t,)))
+        self.stat_vars["focus"].set(
+            db.one("SELECT COALESCE(SUM(minutes),0) FROM sessions WHERE day=?", (t,)))
+        spent = db.one("SELECT COALESCE(SUM(amount),0) FROM expenses WHERE day LIKE ?",
+                       (t[:7] + "%",))
+        self.stat_vars["spent"].set(f"\u20b9{spent:,.0f}")
+
+        days = [dt.date.today() - dt.timedelta(days=i) for i in range(6, -1, -1)]
+        items = []
+        for d in days:
+            m = db.one("SELECT COALESCE(SUM(minutes),0) FROM sessions WHERE day=?",
+                       (d.isoformat(),))
+            items.append((d.strftime("%a"), m))
+        draw_bars(self.chart, items)
+
+        nxt = db.rows("SELECT title,due FROM tasks WHERE done=0 ORDER BY due LIMIT 5")
+        self.upnext.config(text="\n".join(f"\u2022 {r['title']}  ({r['due']})" for r in nxt)
+                           or "All caught up!")
+
+
+# ------------------------------------------------------------- Task planner
+class TaskTab(ttk.Frame):
+    def __init__(self, parent, app):
+        super().__init__(parent, style="Page.TFrame", padding=16)
+        self.app = app
+        form = card(self, padx=14, pady=10)
+        form.pack(fill="x")
+        self.title_var = tk.StringVar()
+        self.subject = ttk.Combobox(form, values=SUBJECTS, state="readonly", width=14)
+        self.subject.current(0)
+        self.due = ttk.Entry(form, width=12)
+        self.due.insert(0, today())
+        self.priority = ttk.Combobox(form, values=["High", "Medium", "Low"],
+                                     state="readonly", width=9)
+        self.priority.current(1)
+        title_entry = ttk.Entry(form, textvariable=self.title_var, width=34)
+        field(form, "Task title", 0, title_entry)
+        field(form, "Subject", 1, self.subject)
+        field(form, "Due (YYYY-MM-DD)", 2, self.due)
+        field(form, "Priority", 3, self.priority)
+        ttk.Button(form, text="Add task", style="Accent.TButton",
+                   command=self.add).grid(row=1, column=4, pady=(0, 4))
+        title_entry.bind("<Return>", lambda e: self.add())
+
+        bar = tk.Frame(self, bg=C["bg"])
+        bar.pack(fill="x", pady=(12, 6))
+        tk.Label(bar, text="Show:", bg=C["bg"], fg=C["muted"]).pack(side="left")
+        self.filter = ttk.Combobox(bar, values=["All", "Pending", "Done"],
+                                   state="readonly", width=9)
+        self.filter.current(0)
+        self.filter.pack(side="left", padx=6)
+        self.filter.bind("<<ComboboxSelected>>", lambda e: self.refresh())
+        ttk.Button(bar, text="Delete", command=self.delete).pack(side="right")
+        ttk.Button(bar, text="Mark done / undo", command=self.toggle).pack(side="right", padx=6)
+
+        frame, self.tree = make_tree(
+            self, [("done", "Done"), ("title", "Task"), ("subject", "Subject"),
+                   ("due", "Due"), ("priority", "Priority")],
+            [60, 340, 120, 110, 90], height=12)
+        frame.pack(fill="both", expand=True)
+        self.tree.tag_configure("overdue", foreground=C["bad"])
+        self.tree.tag_configure("done", foreground=C["muted"])
+
+    def add(self):
+        title = self.title_var.get().strip()
+        due = self.due.get().strip()
+        if not title:
+            return messagebox.showwarning("Missing title", "Please enter a task title.")
+        try:
+            dt.date.fromisoformat(due)
+        except ValueError:
+            return messagebox.showwarning("Invalid date", "Use the format YYYY-MM-DD.")
+        self.app.db.run("INSERT INTO tasks(title,subject,due,priority) VALUES(?,?,?,?)",
+                        (title, self.subject.get(), due, self.priority.get()))
+        self.title_var.set("")
+        self.app.refresh_all()
+
+    def _selected_id(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("Select a task", "Click a task in the list first.")
+            return None
+        return int(sel[0])
+
+    def toggle(self):
+        tid = self._selected_id()
+        if tid:
+            self.app.db.run("UPDATE tasks SET done = 1 - done WHERE id=?", (tid,))
+            self.app.refresh_all()
+
+    def delete(self):
+        tid = self._selected_id()
+        if tid and messagebox.askyesno("Delete", "Delete the selected task?"):
+            self.app.db.run("DELETE FROM tasks WHERE id=?", (tid,))
+            self.app.refresh_all()
+
+    def refresh(self):
+        self.tree.delete(*self.tree.get_children())
+        where = {"Pending": "WHERE done=0", "Done": "WHERE done=1"}.get(self.filter.get(), "")
+        order = "ORDER BY done, due, CASE priority WHEN 'High' THEN 0 WHEN 'Medium' THEN 1 ELSE 2 END"
+        for r in self.app.db.rows(f"SELECT * FROM tasks {where} {order}"):
+            tags = ("done",) if r["done"] else (("overdue",) if r["due"] < today() else ())
+            self.tree.insert("", "end", iid=r["id"], tags=tags,
+                             values=("Yes" if r["done"] else "-", r["title"],
+                                     r["subject"], r["due"], r["priority"]))
+
+
+# -------------------------------------------------------------- Focus timer
+class FocusTab(ttk.Frame):
+    def __init__(self, parent, app):
+        super().__init__(parent, style="Page.TFrame", padding=16)
+        self.app = app
+        self.total = self.remaining = 25 * 60
+        self.running = False
+        self.job = None
+
+        left = card(self, padx=20, pady=16)
+        left.pack(side="left", fill="y")
+        self.dial = tk.Canvas(left, width=300, height=300, bg=C["card"],
+                              highlightthickness=0)
+        self.dial.pack()
+        ctl = tk.Frame(left, bg=C["card"])
+        ctl.pack(pady=10)
+        self.start_btn = ttk.Button(ctl, text="Start", style="Accent.TButton",
+                                    command=self.toggle)
+        self.start_btn.pack(side="left", padx=4)
+        ttk.Button(ctl, text="Reset", command=self.reset).pack(side="left", padx=4)
+
+        opts = tk.Frame(left, bg=C["card"])
+        opts.pack()
+        tk.Label(opts, text="Minutes", bg=C["card"], fg=C["muted"]).grid(row=0, column=0)
+        self.minutes = ttk.Spinbox(opts, from_=1, to=180, width=5, command=self.apply_minutes)
+        self.minutes.set(25)
+        self.minutes.grid(row=0, column=1, padx=6)
+        self.minutes.bind("<KeyRelease>", lambda e: self.apply_minutes())
+        for i, m in enumerate((15, 25, 45)):
+            ttk.Button(opts, text=f"{m}m", width=4,
+                       command=lambda m=m: self.preset(m)).grid(row=0, column=2 + i, padx=2)
+        self.label = ttk.Entry(left, width=30)
+        self.label.insert(0, "Study session")
+        self.label.pack(pady=(10, 0))
+
+        right = card(self, padx=16, pady=14)
+        right.pack(side="left", fill="both", expand=True, padx=(14, 0))
+        self.today_var = tk.StringVar()
+        tk.Label(right, textvariable=self.today_var, bg=C["card"], fg=C["primary"],
+                 font=(FONT, 16, "bold")).pack(anchor="w")
+        tk.Label(right, text="Recent sessions", bg=C["card"], fg=C["muted"]).pack(
+            anchor="w", pady=(8, 4))
+        frame, self.tree = make_tree(right, [("day", "Date"), ("min", "Minutes"),
+                                             ("label", "Label")], [100, 80, 180], 10)
+        frame.pack(fill="both", expand=True)
+        self.draw()
+
+    # --- timer logic
+    def preset(self, m):
+        if not self.running:
+            self.minutes.set(m)
+            self.apply_minutes()
+
+    def apply_minutes(self):
+        if self.running:
+            return
+        try:
+            m = max(1, min(180, int(self.minutes.get())))
+        except ValueError:
+            return
+        self.total = self.remaining = m * 60
+        self.draw()
+
+    def toggle(self):
+        if self.running:
+            self.running = False
+            self.after_cancel(self.job)
+            self.start_btn.config(text="Resume")
+        else:
+            self.running = True
+            self.start_btn.config(text="Pause")
+            self.job = self.after(1000, self.tick)
+
+    def tick(self):
+        self.remaining -= 1
+        self.draw()
+        if self.remaining <= 0:
+            self.finish()
+        else:
+            self.job = self.after(1000, self.tick)
+
+    def finish(self):
+        self.running = False
+        mins = self.total // 60
+        self.app.db.run("INSERT INTO sessions(day,minutes,label) VALUES(?,?,?)",
+                        (today(), mins, self.label.get().strip() or "Study session"))
+        self.bell()
+        self.reset()
+        self.app.refresh_all()
+        messagebox.showinfo("Well done!", f"{mins} minutes of focus logged. Take a short break.")
+
+    def reset(self):
+        if self.job:
+            self.after_cancel(self.job)
+            self.job = None
+        self.running = False
+        self.start_btn.config(text="Start")
+        self.remaining = self.total
+        self.draw()
+
+    # --- drawing
+    def draw(self):
+        d = self.dial
+        d.delete("all")
+        d.create_oval(20, 20, 280, 280, outline=C["line"], width=14)
+        frac = self.remaining / self.total if self.total else 0
+        if frac > 0:
+            d.create_arc(20, 20, 280, 280, start=90, extent=-359.9 * frac,
+                         style="arc", outline=C["primary"], width=14)
+        m, s = divmod(self.remaining, 60)
+        d.create_text(150, 140, text=f"{m:02d}:{s:02d}", fill=C["text"],
+                      font=(FONT, 40, "bold"))
+        d.create_text(150, 185, text="running" if self.running else "ready",
+                      fill=C["muted"], font=(FONT, 11))
+
+    def refresh(self):
+        mins = self.app.db.one("SELECT COALESCE(SUM(minutes),0) FROM sessions WHERE day=?",
+                               (today(),))
+        self.today_var.set(f"Today: {mins} min focused")
+        self.tree.delete(*self.tree.get_children())
+        for r in self.app.db.rows("SELECT * FROM sessions ORDER BY id DESC LIMIT 12"):
+            self.tree.insert("", "end", values=(r["day"], r["minutes"], r["label"]))
+
+
+# ---------------------------------------------------------- Expense tracker
+class ExpenseTab(ttk.Frame):
+    def __init__(self, parent, app):
+        super().__init__(parent, style="Page.TFrame", padding=16)
+        self.app = app
+        form = card(self, padx=14, pady=10)
+        form.pack(fill="x")
+        self.date = ttk.Entry(form, width=12)
+        self.date.insert(0, today())
+        self.cat = ttk.Combobox(form, values=CATEGORIES, state="readonly", width=14)
+        self.cat.current(0)
+        self.amount = ttk.Entry(form, width=10)
+        self.note = ttk.Entry(form, width=24)
+        field(form, "Date", 0, self.date)
+        field(form, "Category", 1, self.cat)
+        field(form, "Amount (\u20b9)", 2, self.amount)
+        field(form, "Note", 3, self.note)
+        ttk.Button(form, text="Add expense", style="Accent.TButton",
+                   command=self.add).grid(row=1, column=4, pady=(0, 4))
+
+        body = tk.Frame(self, bg=C["bg"])
+        body.pack(fill="both", expand=True, pady=(12, 0))
+        body.columnconfigure(0, weight=1)
+        body.columnconfigure(1, weight=1)
+        body.rowconfigure(0, weight=1)
+
+        left = card(body, padx=10, pady=10)
+        left.grid(row=0, column=0, sticky="nsew")
+        frame, self.tree = make_tree(left, [("day", "Date"), ("cat", "Category"),
+                                            ("amt", "Amount"), ("note", "Note")],
+                                     [90, 100, 80, 120], 10)
+        frame.pack(fill="both", expand=True)
+        ttk.Button(left, text="Delete selected", command=self.delete).pack(
+            anchor="e", pady=(8, 0))
+
+        right = card(body, padx=14, pady=10)
+        right.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
+        top = tk.Frame(right, bg=C["card"])
+        top.pack(fill="x")
+        tk.Label(top, text="Monthly budget \u20b9", bg=C["card"], fg=C["muted"]).pack(side="left")
+        self.budget = ttk.Entry(top, width=8)
+        self.budget.pack(side="left", padx=6)
+        ttk.Button(top, text="Set", width=5, command=self.set_budget).pack(side="left")
+        self.summary = tk.Label(right, bg=C["card"], fg=C["text"], font=(FONT, 11, "bold"))
+        self.summary.pack(anchor="w", pady=(10, 2))
+        self.progress = ttk.Progressbar(right, maximum=100)
+        self.progress.pack(fill="x")
+        tk.Label(right, text="This month by category", bg=C["card"], fg=C["muted"]).pack(
+            anchor="w", pady=(10, 0))
+        self.chart = tk.Canvas(right, bg=C["card"], highlightthickness=0, height=170)
+        self.chart.pack(fill="both", expand=True)
+        self.chart.bind("<Configure>", lambda e: self.refresh())
+
+    def add(self):
+        try:
+            day = dt.date.fromisoformat(self.date.get().strip()).isoformat()
+            amt = float(self.amount.get())
+            if amt <= 0:
+                raise ValueError
+        except ValueError:
+            return messagebox.showwarning("Invalid input",
+                                          "Enter a valid date (YYYY-MM-DD) and a positive amount.")
+        self.app.db.run("INSERT INTO expenses(day,category,amount,note) VALUES(?,?,?,?)",
+                        (day, self.cat.get(), amt, self.note.get().strip()))
+        self.amount.delete(0, "end")
+        self.note.delete(0, "end")
+        self.app.refresh_all()
+
+    def delete(self):
+        sel = self.tree.selection()
+        if sel and messagebox.askyesno("Delete", "Delete the selected expense?"):
+            self.app.db.run("DELETE FROM expenses WHERE id=?", (int(sel[0]),))
+            self.app.refresh_all()
+
+    def set_budget(self):
+        try:
+            value = float(self.budget.get())
+            if value <= 0:
+                raise ValueError
+        except ValueError:
+            return messagebox.showwarning("Invalid budget", "Enter a positive number.")
+        self.app.db.set_budget(value)
+        self.app.refresh_all()
+
+    def refresh(self):
+        db = self.app.db
+        self.tree.delete(*self.tree.get_children())
+        for r in db.rows("SELECT * FROM expenses ORDER BY day DESC, id DESC LIMIT 100"):
+            self.tree.insert("", "end", iid=r["id"],
+                             values=(r["day"], r["category"], f"\u20b9{r['amount']:,.0f}", r["note"]))
+        month = today()[:7] + "%"
+        spent = db.one("SELECT COALESCE(SUM(amount),0) FROM expenses WHERE day LIKE ?", (month,))
+        budget = db.get_budget()
+        if self.focus_get() is not self.budget:
+            self.budget.delete(0, "end")
+            self.budget.insert(0, f"{budget:g}")
+        over = spent > budget
+        self.summary.config(text=f"\u20b9{spent:,.0f} of \u20b9{budget:,.0f} spent"
+                                 + ("  - over budget!" if over else ""),
+                            fg=C["bad"] if over else C["text"])
+        self.progress["value"] = min(100, spent / budget * 100)
+        items = [(c, db.one("SELECT COALESCE(SUM(amount),0) FROM expenses "
+                            "WHERE day LIKE ? AND category=?", (month, c)))
+                 for c in CATEGORIES]
+        draw_bars(self.chart, items)
+
+
+# ---------------------------------------------------------------- main app
+class App(tk.Tk):
+    def __init__(self, db):
+        super().__init__()
+        self.db = db
+        self.title("StudyBuddy - Student Productivity Hub")
+        self.geometry("1000x660")
+        self.minsize(900, 600)
+        self.configure(bg=C["bg"])
+        self.style_widgets()
+
+        head = tk.Frame(self, bg=C["primary"], padx=20, pady=12)
+        head.pack(fill="x")
+        tk.Label(head, text="StudyBuddy", bg=C["primary"], fg="white",
+                 font=(FONT, 20, "bold")).pack(side="left")
+        self.clock = tk.Label(head, bg=C["primary"], fg="#E6DFFA", font=(FONT, 11))
+        self.clock.pack(side="right")
+
+        self.nb = ttk.Notebook(self)
+        self.nb.pack(fill="both", expand=True, padx=10, pady=10)
+        self.tabs = {"Dashboard": DashboardTab(self.nb, self),
+                     "Tasks": TaskTab(self.nb, self),
+                     "Focus Timer": FocusTab(self.nb, self),
+                     "Expenses": ExpenseTab(self.nb, self)}
+        for name, tab in self.tabs.items():
+            self.nb.add(tab, text=f"  {name}  ")
+        self.nb.bind("<<NotebookTabChanged>>", lambda e: self.refresh_all())
+        self.bind("<Control-q>", lambda e: self.destroy())
+        self.refresh_all()
+        self.update_clock()
+
+    def style_widgets(self):
+        s = ttk.Style(self)
+        s.theme_use("clam")
+        s.configure("Page.TFrame", background=C["bg"])
+        s.configure("TNotebook", background=C["bg"], borderwidth=0)
+        s.configure("TNotebook.Tab", padding=(14, 8), font=(FONT, 11), background="#E4DFF3")
+        s.map("TNotebook.Tab", background=[("selected", C["card"])],
+              foreground=[("selected", C["primary"])])
+        s.configure("Treeview", rowheight=28, font=(FONT, 10), background=C["card"],
+                    fieldbackground=C["card"], borderwidth=0)
+        s.configure("Treeview.Heading", font=(FONT, 10, "bold"), background="#ECE8F7",
+                    foreground=C["text"], relief="flat")
+        s.map("Treeview", background=[("selected", "#DCD3F5")], foreground=[("selected", C["text"])])
+        s.configure("TButton", padding=(10, 5), font=(FONT, 10))
+        s.configure("Accent.TButton", background=C["primary"], foreground="white",
+                    font=(FONT, 10, "bold"))
+        s.map("Accent.TButton", background=[("active", C["primary_dark"])])
+        s.configure("Horizontal.TProgressbar", troughcolor=C["line"], background=C["good"])
+
+    def update_clock(self):
+        self.clock.config(text=dt.datetime.now().strftime("%A, %d %B %Y   %H:%M"))
+        self.after(30000, self.update_clock)
+
+    def refresh_all(self):
+        for tab in self.tabs.values():
+            tab.refresh()
+
+
+def main():
+    if "--demo" in sys.argv:
+        db = Database(Path(tempfile.mkdtemp()) / "demo.db")
+        db.seed_demo()
+    else:
+        db = Database()
+    App(db).mainloop()
+
+
+if __name__ == "__main__":
+    main()
